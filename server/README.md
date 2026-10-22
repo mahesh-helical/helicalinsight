@@ -25,7 +25,7 @@ The server is a Maven multi-module project (version `7.0.0`):
 | `adhoc` | Ad hoc report engine and metadata |
 | `instant` | Instant BI integration |
 | `cache` | Caching layer |
-| `export` | Report export (Chrome headless, PDF, Excel) |
+| `export` | Report export (Chrome headless, PDF, Excel) and [resumable upload/download](docs/resumable-transfer.md) |
 | `externalauth` | SSO and external authentication |
 | `hwf` | Helical Workflow |
 | `scheduling` | Quartz-based job scheduling |
@@ -418,6 +418,7 @@ Create a second database (`hischeduledata`) for Quartz if using the JDBC job sto
 | 404 on `/hi-ee` | WAR not deployed or Tomcat not started | Check `$CATALINA_HOME/webapps/` and Tomcat logs |
 | Database connection errors | Wrong JDBC URL or DB not running | Verify `application-context.xml` / Maven profile DB settings |
 | Export/PDF fails | Chrome not installed | Install Chrome and the matching chromedriver; in Docker set `INSTALL_CHROME=true` |
+| Resumable export returns 410, or upload stops after a chunk | Ticket expired, JVM restarted, or prepare and download hit different nodes | See [resumable upload and download](docs/resumable-transfer.md). Tickets live in memory for 60 minutes on one JVM |
 | Wrong redirect URL | `BaseUrl` mismatch | Update `hi-repository/System/Admin/setting.xml` or set `HOST_IP` when using Docker |
 | Container cannot reach database | Wrong JDBC hostname | Use `-Denv=docker` and hostname `postgres` on a shared Docker network |
 | Out of memory during Maven build | Insufficient heap | `export MAVEN_OPTS="-Xmx2g"` |
@@ -429,6 +430,7 @@ Create a second database (`hischeduledata`) for Quartz if using the JDBC job sto
 
 ## Related documentation
 
+- [Resumable upload and download](docs/resumable-transfer.md) — transfer tickets, `/fileDownload`, `/uploadChunk`, settings
 - [Frontend README](../client/README.md)
 - [Instant BI README](../instantbi/README.md)
 - [Root README](../README.md) — pick your path (run vs develop)
