@@ -291,5 +291,6 @@ Test results are also written to `jest-stare/` when using the default Jest repor
 ## Related documentation
 
 - [Backend README](../server/README.md)
+- [Resumable upload and download](../server/docs/resumable-transfer.md) — client modules under `src/base/resumable-*.js`
 - [Instant BI README](../instantbi/README.md)
 - [Root README](../README.md) — pick your path (run vs develop)
