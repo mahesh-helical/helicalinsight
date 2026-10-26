@@ -4,7 +4,8 @@
 |----------|-------------|
 | [MODEL_CONSUMPTION.md](MODEL_CONSUMPTION.md) | How models are consumed — `cube_info`, dimensions/measures, `aiContext`, aliases, metadata fallback, and visualization |
 | [URL_CONFIGURATION.md](URL_CONFIGURATION.md) / [URL_CONFIGURATION.docx](URL_CONFIGURATION.docx) | Downstream URL setup between hi-ee and InstantBI (`setting.xml` and `llm_config.yaml`) |
-| [INTERACTIVE_FLOW.md](INTERACTIVE_FLOW.md) | `/interactive` endpoint — diagrams, step-by-step flow, and all use cases |
+| [INTERACTIVE_FLOW.md](INTERACTIVE_FLOW.md) | `/interactive` Fast path — one SQL query and a chart, including the `interactive/fast` package |
 | [INTERACTIVE_COMPLEX_FLOW.md](INTERACTIVE_COMPLEX_FLOW.md) | `/interactive` when the question is complex (Think): use case, class, and sequence diagrams from classify through the cited conclusion |
+| [../helicalbi/sql_agent/README.md](../helicalbi/sql_agent/README.md) | Dashboard agent: plan vs execute, token modes, strategy / diagnostics split, prompts, topic scoring |
 | [SQL_TO_FORMDATA.md](SQL_TO_FORMDATA.md) | SQL → formData: database functions, aggregates, GROUP BY, HAVING, filters, `rm_cols_in_filter`, custom columns |
 | [../TESTING.md](../TESTING.md) | How to run functional, integration, and LLM tests |

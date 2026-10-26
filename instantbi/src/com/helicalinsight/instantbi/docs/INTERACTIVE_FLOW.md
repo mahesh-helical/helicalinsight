@@ -1,12 +1,14 @@
 # Interactive Flow (`POST /interactive`)
 
-This document describes the end-to-end flow for the **interactive** chat endpoint implemented in [`helicalbi/controller/interactive.py`](../helicalbi/controller/interactive.py). It covers request handling, model-file branching, LangGraph orchestration, SQL execution, visualization, response shaping, and all supported use cases.
+This document describes the Fast path of the **interactive** chat endpoint implemented in [`helicalbi/controller/interactive.py`](../helicalbi/controller/interactive.py). It covers request handling, model-file branching, LangGraph orchestration, SQL execution, visualization, and response shaping. Think mode is documented separately.
 
 ---
 
 ## Overview
 
-The `/interactive` endpoint turns a natural-language question into:
+This document is the **Fast** path: one question, one SQL query, one chart. Mode routing (`fast` / `think` / `auto`) is decided before that pipeline. A complex question uses the Think path in [INTERACTIVE_COMPLEX_FLOW.md](INTERACTIVE_COMPLEX_FLOW.md).
+
+The Fast path turns a natural-language question into:
 
 1. Resolved **domain** and **topics** (or reads them from the model file)
 2. Generated **SQL**
@@ -15,6 +17,47 @@ The `/interactive` endpoint turns a natural-language question into:
 5. A **visualization** configuration
 
 The route is the main “ask a question, get SQL + chart + answer” entry point for the HelicalBI model layer.
+
+## Fast-mode package
+
+Implementation is `helicalbi/interactive/fast/`. `helicalbi/interactive/fast_flow.py` is a compatibility facade: it re-exports `run_fast_mode` and `sql_to_data_model`, and it re-exports `SqlExecutor` so tests can patch `helicalbi.interactive.fast_flow.SqlExecutor`.
+
+`POST /interactive` (`controller/interactive.py`):
+
+| Request | Who runs |
+|---------|----------|
+| JSON, mode resolves to fast | `run_fast_mode` → `FastModeOrchestrator` |
+| JSON, mode resolves to think | `ThinkTurn.run()` |
+| `?stream=true` or `stream: true` | `RoutedInteractiveTurn` → `InteractiveTurn` (fast) or `ThinkTurn` (think) |
+
+Production JSON uses `FastModeOrchestrator` only. SSE uses `InteractiveTurn`, which loads the same session, state, cube-merge, and payload classes and walks the graphs itself so it can emit progress events. `InteractiveTurn.run()` is the buffered form of that walk (used by tests); the HTTP JSON handler does not call it. Both the orchestrator and `InteractiveTurn` share `execute_sql_with_retries` and `FastResultPayloadBuilder`.
+
+| Class | Module | Job |
+|-------|--------|-----|
+| `FastModeOrchestrator` | `fast/orchestrator.py` | JSON pipeline: session → intent → SQL → execute+retry → viz → payload |
+| `FastModelSessionLoader` | `fast/session.py` | Semantic layer, metadata, dialect, cube-info vs legacy branch |
+| `FastTurnStateBuilder` | `fast/state_builder.py` | Initial LangGraph state, including cube-info keys |
+| `CubeInfoResultMerger` | `fast/cube_merge.py` | Copy prepared cube-info fields onto the graph result and set `got_domain` |
+| `FastResultPayloadBuilder` | `fast/payload.py` | `chat_response` wire dict and `chat_graph_memory` |
+| `VizFormDataResolver` | `fast/form_data.py` | Keep Adhoc `viz_form_data` when present; else `sql_to_formdata`, else base64 SQL |
+| `SqlDataModelBuilder` | `fast/data_model.py` | Fallback `{query: base64(sql), columns: []}` when Adhoc formData is missing |
+
+Orchestrator stages, in order:
+
+1. `FastModelSessionLoader.load` — cube-info models go through `prepare_cube_info_model_data`; legacy models go through `prevalidate_cube_metadata`.
+2. `FastTurnStateBuilder.build` — chat history is `ChatManager.get_last_n`, then `input.last_chats` if that is empty.
+3. Intent: cube-info runs `CubeInfoFlow`, merges prepared fields, then `main_graph`. Legacy runs `main_graph` only.
+4. SQL: `cube_info_sql_generator_graph` or `sql_generator_graph`.
+5. `execute_sql_with_retries` (`SqlExecutor.process_flow`, regenerate via the SQL graph) then `write_insight`.
+6. `viz_graph`. Messages and `last_chats` are cleared on the result before the payload is built.
+7. `FastResultPayloadBuilder` sets `mode` to `fast` and persists chat-graph memory.
+
+Constraints:
+
+- Abort is checked between stages (`ensure_not_aborted`). A cancelled request returns `aborted: true` and does not add a chat-graph memory node on the success path.
+- `sql_to_data_model` runs only when Adhoc `sql_to_formdata` did not produce `viz_form_data`. It needs non-empty SQL and a metadata file name.
+- Cube-info key lists (`CUBE_INFO_STATE_KEYS`, `CUBE_INFO_RESULT_KEYS`) live in `fast/constants.py`. Add a field there when both the state bag and the merge must carry it.
+- Mode aliases (`quick`/`normal` → fast, `deep`/`agent`/`research` → think) are in `helicalbi/interactive/modes.py`, not in this package.
 
 ## Streaming (`streamResponse`)
 
@@ -562,6 +605,9 @@ Used by intent rephrase, column detection, and SQL generation prompts.
 | Area | File |
 |------|------|
 | HTTP route | [`helicalbi/controller/interactive.py`](../helicalbi/controller/interactive.py) |
+| Fast-mode package | [`helicalbi/interactive/fast/`](../helicalbi/interactive/fast/) (`orchestrator.py`, `session.py`, `state_builder.py`, `cube_merge.py`, `payload.py`, `form_data.py`, `data_model.py`) |
+| Fast-mode facade | [`helicalbi/interactive/fast_flow.py`](../helicalbi/interactive/fast_flow.py) |
+| Mode aliases | [`helicalbi/interactive/modes.py`](../helicalbi/interactive/modes.py) |
 | Cancellation | [`helicalbi/controller/abort.py`](../helicalbi/controller/abort.py) |
 | Cube-info detection/conversion | [`helicalbi/common/CubeInfoModel.py`](../helicalbi/common/CubeInfoModel.py) |
 | Cube-info flow | [`helicalbi/core/flows/CubeInfoFlow.py`](../helicalbi/core/flows/CubeInfoFlow.py) |
