@@ -1,560 +1,213 @@
-# InstantBI Dashboard Agent — Code Flow
+# InstantBI Dashboard Agent
 
-Reactive (ReAct) LangGraph agent: the planner calls tools, observes results, and loops until it has a **multi-step investigation picture** — not a one-shot answer.
+Plan-then-execute agent for multi-chart dashboards. A question is turned into a stored investigation plan. A later request with the same dashboard id runs that plan chart by chart, then writes a narrative and a layout.
 
 | Layer | Location |
 |-------|----------|
-| Java proxy | `POST /ai/agent-dashboard` (`mode` optional) |
+| Java proxy | `POST /ai/agent-dashboard` (`InstantBIController`) |
 | InstantBI HTTP | `helicalbi/controller/agent_dashboard.py` → `POST /agent-dashboard` |
-| Graph | `helicalbi/sql_agent/dashboard_graph.py` → `run_dashboard_agent` |
+| Plan | `helicalbi/sql_agent/investigation.py` → `create_and_store_plan` |
+| Execute | `helicalbi/sql_agent/dashboard_graph.py` → `run_dashboard_agent` |
 | Modes | `helicalbi/sql_agent/modes.py` — `fast` / `balanced` / `research` |
+
+`/interactive` is a different pipeline. Fast chat lives in `helicalbi/interactive/fast` (see [INTERACTIVE_FLOW.md](../../docs/INTERACTIVE_FLOW.md)). Think chat reuses this agent's plan graph with `flat_sql=True`.
+
+## Two HTTP phases
+
+`agent_dashboard()` does not run the tool loop on the first call.
+
+| Phase | How to trigger | What runs | Response `phase` |
+|-------|----------------|-----------|------------------|
+| Plan | Any question that is not an execute command | `create_and_store_plan` | `plan` |
+| Execute | Query text `execute plan`, `execute_plan`, `run plan`, or `run_plan`, or `input.action` / `input.phase` in `execute`, `execute_plan`, `run`, `run_plan` | Load the stored plan, then `run_dashboard_agent` | `execute` |
+
+Execute requires a plan already saved for the same `dashboardid` and `dashboard_sequence_id`. Otherwise the handler raises: ask a question first, then send `execute plan`.
+
+Required body fields: `input.inputString`, `input.model.file`, `input.model.dir`, `input.dashboardid`. `dashboard_sequence_id` (alias `dashboard_seq_id`) defaults to `"1"`. `input.mode` or `input.agent_mode` selects the token profile; otherwise `dashboard.default_mode` from config. Chart ceiling is `dashboard.max_sub_questions`, applied inside `resolve_mode_profile`.
+
+Optional plan hints: `input.persona` / `input.user_persona`, `input.strategy` / `input.strategy_id`, plus role and profile from `resolve_role_profile`.
+
+Plan response highlights: `persona`, `strategy` (id only), `strategy_detail`, `plan` (public keys only), `asked_questions` taken from planned chart questions, empty `dashboard` and `final_answer`, `message` telling the client to send `execute plan`.
+
+Execute response highlights: `final_answer`, `dashboard`, `sub_questions` (including `report_model`), `investigation_steps`, `attempt_count`, `token_usage`, and the same `plan` / `strategy` / `persona`.
 
 ## Token modes
 
-| Mode | Purpose | Charts | Loops | Overview | LLM synthesizer |
-|------|---------|--------|-------|----------|-----------------|
-| `fast` | Low tokens / latency | ≤2 | ≤10 | truncated short | no |
-| `balanced` | Default | ≤5 | ≤24 | medium | yes |
-| `research` | Deeper picture | ≤8* | ≤40 | large | yes |
+| Mode | Purpose | Charts | Loops | Overview chars | LLM synthesizer | Semantic reuse |
+|------|---------|--------|-------|----------------|-----------------|----------------|
+| `fast` | Low tokens / latency | ≤2 | ≤10 | 1200 | no (rule-based summary) | yes |
+| `balanced` | Default | ≤5 | ≤24 | 3500 | yes | yes |
+| `research` | Deeper picture | ≤8 | ≤40 | 8000 | yes | no |
 
-\* Also capped by `dashboard.max_sub_questions`. Set `input.mode` or config `dashboard.default_mode`.
+`config_max_charts` (`dashboard.max_sub_questions`) lowers `max_charts` but does not raise it. Aliases: `quick`/`cheap` → fast, `default`/`normal` → balanced, `deep`/`thorough` → research.
 
-Extra token controls:
+Planner tool bind list (`planner_tools`), not the ToolNode registry:
 
-- Compact tool messages after `state_patch` is applied (`token_budget.py`)
-- Trim planner history to last N tool rounds (fast=2, balanced=4, research=8)
-- Fast/balanced reuse semantic retrieve across facets
-- Fast binds fewer tools (no `validate_sql` / `analyze_result` / `retrieve_schema`)
-- Auto-finish when chart cap is reached (skips another planner LLM call)
-- Agent InstantBI SQL/viz graph (`instantbi_agent_graph.py`): skip domain discovery +
-  intent rephrase when topics are seeded; fast mode skips viz polish LLM
+| Mode | Bound tools |
+|------|-------------|
+| `fast` | `retrieve_semantic_model`, `generate_sql`, `execute_query`, `build_report`, `finish_dashboard` |
+| `balanced` | fast set plus `retrieve_schema`, `analyze_result` |
+| `research` | balanced set plus `validate_sql` |
 
-### Agent InstantBI branch (`generate_sql` / `build_report`)
+`dashboard_tools()` always returns the full registry so a ToolNode can run any call. Only `research` binds `validate_sql` to the planner LLM. Fast and balanced also skip intent rephrase when topics are already seeded (`skip_intent_rephrase`). Fast skips viz polish (`skip_viz_polish`). History kept for the planner is 2 / 4 / 8 tool rounds.
+
+LangGraph `recursion_limit` is `max_tool_loops * 3 + 8` (`DASHBOARD_NODES_PER_TOOL_LOOP` plus exit overhead). On execute, a stored plan sets the chart cap to the planned chart count when `flat_sql` is set; otherwise it is `min(profile cap, planned count)`.
+
+## Dashboard graph
+
+```text
+START
+  ├─ investigation_plan.charts → execute_plan → synthesizer → dashboard → END
+  └─ no planned charts         → planner ⇄ tools → apply_patches
+                                    └─ stop → synthesizer → dashboard → END
+```
+
+`route_start` sends the run to `execute_plan` when `has_planned_charts` is true (each chart has a non-empty `question`). That node is deterministic: semantic retrieve → generate SQL → execute with retry → build report → insight. It does not call the planner LLM. After the charts, control goes straight to the synthesizer.
+
+The free-form loop is the fallback (tests, or a run with no chart specs). `gathering_should_stop` ends it when `is_complete` is set, the chart cap is reached (`charts_complete`), or `tool_loop_count >= max_tool_loops`. The planner itself returns `is_complete` on those same caps before another LLM call. `apply_tool_patches` folds each tool's `state_patch` into state and shrinks the tool messages.
+
+Fast mode synthesizer builds a numbered text summary from `build_run_summary` and does not call the LLM. Balanced and research call `SYNTHESIZER_PROMPT`. `build_run_summary` is programmatic: `asked_questions`, `attempt_count` (`tool_loop_count`), and `investigation_steps` (`chart` vs `lookup` from `include_in_dashboard`).
+
+`run_dashboard_agent` loads the model session, installs in-memory schema and semantic indexers under `dashboard:{thread_id}`, then invokes the graph. `SchemaIndexer()` is constructed with no `persist_directory`, so the default index is `InMemoryVectorIndex`. Chroma is used only when a persist directory is passed and `chromadb` imports.
+
+SQL execution goes through `execute_sql_state` → `SqlExecutor.process_flow`. Result rows are capped at `DEFAULT_RESULT_ROW_CAP` (50).
+
+## Strategy engine
+
+The old monolithic strategy module is split. Callers (controllers, plan graph, tests) should import the stable names from `helicalbi.sql_agent.strategy_tree`. That module is a facade. Implementation lives in `helicalbi.sql_agent.strategy`. Paths, ids, and scoring weights live in `helicalbi.sql_agent.constants`.
+
+| Module | Responsibility |
+|--------|----------------|
+| `strategy/catalog.py` | Read `strategies/dashboard_strategies.json` and `strategies/analytical_strategy.json`. LRU-cached. `get_strategy` falls back to `default_strategy`, then the first entry. |
+| `strategy/selection.py` | Pick one strategy. |
+| `strategy/analytical.py` | Rank analytical operations for a question. |
+| `strategy/diagnostics.py` | Match model diagnostic capabilities, classify their `uses`, and lock Think scope. |
+| `strategy/prompts.py` | Prompt blocks for a strategy, the analytical catalog, and matched diagnostics. |
+| `strategy/runtime.py` | `public_strategy` (id only), `public_persona` (nested strategy objects stripped), `resolve_plan_runtime` (layout/color from the catalog), `charts_from_strategy`. |
+| `strategy/text_utils.py` | `clean` / `compact` string helpers. |
+
+JSON catalogs stay in `sql_agent/strategies/`. `clear_strategy_catalog_cache()` drops the dashboard-catalog LRU (tests and hot reload).
+
+### How a strategy is chosen
+
+`select_strategy(question, persona=, hint=, diagnostic_capabilities=)`:
+
+1. Use `hint`, else `persona.strategy_hint` or `persona.strategy_id`, if that id exists in the catalog. Selection source is `hint`. Hyphens and spaces are normalized to underscores.
+2. Otherwise classify intent from catalog keyword lists (`classify_intent`; fallback intent is `overview`) and walk `decision_tree` with persona name, intent, and hint. Selection source is `decision_tree`.
+3. If capabilities were passed, attach the first capability whose name or applicable measure is mentioned in the question.
+
+Retired layout ids are aliases, not separate templates: `so_what_contextual_anchoring` → `inverted_pyramid`, `intent_driven_layout` → `semantic_color_coding`.
+
+`create_and_store_plan` calls `select_strategy` once up front, then again when the semantic indexer (or `cube_info_prepared`) exposes diagnostic capabilities. `attach_strategy` stores the chosen id on the persona. The public API returns the id via `public_strategy`, not the full catalog object. `plan_to_public_dict` keeps `persona`, `tier`, `strategy_id`, `template_id`, `domain`, `topics`, `original_question`, `rationale`, `charts`, `analytical_operations`, `query_analytical_strategies`.
+
+The plan-context graph (`nodes/plan_graph.py`, entry `run_plan_context_graph`) is:
+
+```text
+load_semantic_context → select_domain_topics → enrich_topic_context
+  → select_analytical_operations → draft_chart_questions → validate_questions
+       └─ validation_feedback and repair_count ≤ PLAN_GRAPH_MAX_REPAIR (1) → draft again
+```
+
+`dashboard_node` hydrates layout and color with `resolve_plan_runtime`.
+
+### Diagnostics
+
+Diagnostic capabilities come from the semantic model (`diagnosticCapabilities` or `diagnostic_capabilities`).
+
+| Function | When it matters |
+|----------|-----------------|
+| `match_diagnostic_capabilities` | Capabilities whose name or applicable measures match the question. |
+| `resolve_diagnostic_uses` | Each `uses` entry classified as strategy, measure, dimension, or other. |
+| `expand_decompose_measures` | Formula components pulled in for decompose-style uses. |
+| `operations_for_diagnostic_uses` | Analytical operations required by those uses. If empty, `select_analytical_operations` scores the catalog instead (default max 5). |
+| `diagnostic_field_scope` / `diagnostic_scope_lock` | Think prompts stay inside the configured strategies, measures, and dimensions. |
+| `charts_within_diagnostic_scope` | Drop chart fields outside that scope. |
+| `measure_trait_guidance` | Grain, additivity, and direction text. Also used by `sql/GetContextForSQL.py`. |
+
+The plan-graph node runs the match / resolve / expand path only when `flat_sql` is true and capabilities are present (Think). A normal dashboard plan still passes capabilities into `select_strategy`, which only does the lighter name-or-measure match above.
+
+Custom analytical operations on the model are merged in `catalog.custom_operations_from_source` / `merge_custom_operations`. `list_analytical_operations_for_api` is the projection served to utility-config consumers.
+
+## Prompts
+
+Prompt strings live under `helicalbi/sql_agent/prompt/` and are re-exported from `helicalbi.sql_agent.config` so `from helicalbi.sql_agent.config import TOOL_AGENT_PROMPT` still works. Numeric knobs are re-exported from `constants` the same way.
+
+| Module | Contents |
+|--------|----------|
+| `prompt/agent_prompts.py` | `TOOL_AGENT_PROMPT`, `PLAN_EXECUTION_RULES`, orchestration and evaluation prompts |
+| `prompt/plan_prompts.py` | Plan-context and Think flat-SQL planning rules |
+| `prompt/sql_prompts.py` | Think flat-SQL generation and subquery rejection text |
+| `prompt/synthesis_prompts.py` | `SYNTHESIZER_PROMPT`, Think final-answer prompt |
+| `prompt/insight_prompts.py` | Step insight and success-execution prompts |
+| `prompt/routing_prompts.py` | `AUTO_MODE_PROMPT` (interactive auto router) |
+
+`TOOL_AGENT_PROMPT` is formatted in `bootstrap_planner_messages` with `mode_rules`, the original question, a truncated semantic overview, the investigation plan, `PLAN_EXECUTION_RULES` when a plan exists, collected findings, and the chart and loop caps. The planner does not write SQL itself. Lookup steps are `generate_sql → execute_query → analyze_result`. Chart steps are `generate_sql → execute_query → build_report`. Stop with `finish_dashboard`.
+
+## Topic scoring
+
+`planning/scoring.py` (`TopicScorer` / `score_topic`) ranks semantic-model topic rows for `select_domain_topics_node`. It is lexical, not an embedding. Weights in `constants.py`:
+
+| Hit | Score |
+|-----|-------|
+| Exact topic name contained in the question | 5.0 |
+| Exact domain name contained in the question | 3.0 |
+| Component name contained in the question | 2.5 |
+| Question token (length ≥ 3) found in the topic blob | 1.0 |
+| Component token (length ≥ 4) shared with the question | 0.5 |
+
+`plan_graph._score_topic` is a compatibility alias. Domain and topic caps by mode, from `investigation._topic_caps_for_mode`: fast 1 domain / 2 topics, balanced 2 / 3, research 2 / 4.
+
+## Tool scenarios
+
+Semantic retrieve (`tools/semantic.py`):
+
+1. Return the cached payload when the same question was retrieved earlier in the session.
+2. In fast and balanced, if the last hit was `sufficient` and topics exist, reuse it (`reused: true`) and skip another RAG call.
+3. Otherwise call the semantic indexer. If `sufficient` is false, call schema RAG and set `used_metadata_fallback`.
+
+`generate_sql` records the question on `asked_questions` and stores SQL on `generated_sql`. When `flat_sql` is set it appends `THINK_FLAT_SQL_GENERATION` and rejects subqueries. It does not execute.
+
+`execute_query` validates with `validate_sql_against_catalog` before `execute_sql_state`. A hard validation error increments `sql_retry_count` and does not execute. An `Unknown column` error is a soft failure only when physical metadata is loaded; the engine error then feeds the retry. Any execute error also increments `sql_retry_count`; success resets it to 0. The planner prompt tells the model to call `generate_sql` again with that error. `execute_plan` uses `execute_sql_with_retries` instead of the planner.
+
+`analyze_result` appends a finding with `include_in_dashboard: false` (lookup, not a tile). `build_report` appends a finding with `include_in_dashboard: true`. `finish_dashboard` sets `is_complete`.
+
+Agent SQL generation (`instantbi_agent_graph.py`) is separate from `/interactive`:
 
 ```text
 prepare
-  ├─ has selected_topics → seed_domain (got_domain=true)
+  ├─ seeded topics → seed_domain
   │     ├─ fast/balanced → sql_generator
-  │     └─ research → UpdateIntentRephrase → sql_generator
+  │     └─ research → intent rephrase → sql_generator
   └─ no topics → main_graph → sql_generator
-
-viz:
-  fast → VizModelFiller (+ Fallback if needed)
-  balanced/research → full viz_graph
 ```
 
-Interactive `/interactive` is unchanged (still full main_graph + viz_graph).
-
-```python
-# helicalbi/sql_agent/modes.py
-AGENT_MODES = {
-    "fast": AgentModeProfile(..., use_llm_synthesizer=False, max_tool_loops=10, ...),
-    "balanced": AgentModeProfile(...),
-    "research": AgentModeProfile(..., max_tool_loops=40, ...),
-}
-```
-
----
-
-## 0. Tools available to the planner
-
-```12:22:helicalbi/sql_agent/tools/tools.py
-def dashboard_tools():
-    return [
-        retrieve_semantic_model,
-        retrieve_schema,
-        generate_sql,
-        validate_sql,
-        execute_query,
-        analyze_result,
-        build_report,
-        finish_dashboard,
-    ]
-```
-
-Planner intent (multi-step picture, not one-shot) from `config.py`:
-
-```29:71:helicalbi/sql_agent/config.py
-TOOL_AGENT_PROMPT = """You are an InstantBI dashboard agent. Your job is to build a clear
-picture of the user's question by breaking it into focused sub-questions — not to
-resolve everything in one single generate_sql / build_report call.
-...
-Rules:
-- Do not try to answer the whole original question in one shot. Decompose it into
-  complementary facets so the dashboard and findings show a clear multi-step picture.
-- First call retrieve_semantic_model for the user question (or a focused facet of it).
-...
-- Lookup steps: retrieve_semantic_model → generate_sql → execute_query → analyze_result.
-- Chart steps: retrieve_semantic_model → generate_sql → execute_query → build_report.
-- Prefer 3-5 complementary charts (KPI, breakdown, trend). Max charts: {max_charts}.
-...
-- When the multi-step picture is enough, call finish_dashboard.
-"""
-```
-
----
-
-## 1. HTTP entry → agent run
-
-```46:100:helicalbi/controller/agent_dashboard.py
-    @flask_app.route("/agent-dashboard", methods=["POST"])
-    def agent_dashboard():
-        data = request.get_json()
-        ...
-        user_query = user_input.get("inputString") or user_input.get("query") or ""
-        ...
-        model_file_name = model.get("file") or ""
-        location = model.get("dir") or ""
-        thread_id = str(user_input.get("dashboardid") or "")
-        chat_seq_id = (
-            user_input.get("dashboard_sequence_id")
-            or user_input.get("dashboard_seq_id")
-            or "1"
-        )
-        ...
-        max_sub_questions = int(app_config.dashboard_max_sub_questions)
-        ...
-            result = run_dashboard_agent(
-                user_query,
-                session_cookie=session_cookie,
-                username=username,
-                model_file_name=model_file_name,
-                model_location=location,
-                thread_id=thread_id,
-                chat_seq_id=chat_seq_id,
-                last_chats=user_input.get("last_chats"),
-                request_id=request_id,
-                max_sub_questions=max_sub_questions,
-            )
-```
-
-Required request fields: `inputString`, `model.file`, `model.dir`, `dashboardid`, `dashboard_sequence_id`. Chart cap comes from config (`dashboard.max_sub_questions`), not the body.
-
----
-
-## 2. High-level LangGraph
-
-```text
-START → planner → tools → apply_patches → planner (loop)
-                 ↘ synthesizer → dashboard → END
-```
-
-Graph wiring:
-
-```42:63:helicalbi/sql_agent/dashboard_graph.py
-def build_dashboard_agent(checkpointer=None):
-    workflow = StateGraph(AgentState)
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("tools", ToolNode(dashboard_tools()))
-    workflow.add_node("apply_patches", apply_tool_patches)
-    workflow.add_node("synthesizer", synthesizer_node)
-    workflow.add_node("dashboard", dashboard_node)
-
-    workflow.add_edge(START, "planner")
-    workflow.add_conditional_edges(
-        "planner",
-        route_planner,
-        {"tools": "tools", "synthesizer": "synthesizer"},
-    )
-    workflow.add_edge("tools", "apply_patches")
-    workflow.add_conditional_edges(
-        "apply_patches",
-        route_after_tools,
-        {"planner": "planner", "synthesizer": "synthesizer"},
-    )
-    workflow.add_edge("synthesizer", "dashboard")
-    workflow.add_edge("dashboard", END)
-```
-
-Routing:
-
-```22:39:helicalbi/sql_agent/dashboard_graph.py
-def route_planner(state: AgentState) -> str:
-    if state.get("is_complete"):
-        return "synthesizer"
-    if int(state.get("tool_loop_count") or 0) >= DEFAULT_MAX_TOOL_LOOPS:
-        return "synthesizer"
-    messages = state.get("messages") or []
-    last = messages[-1] if messages else None
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return "tools"
-    ...
-    return "synthesizer"
-
-
-def route_after_tools(state: AgentState) -> str:
-    if state.get("is_complete"):
-        return "synthesizer"
-    return "planner"
-```
-
-Planner loop (increments `tool_loop_count` / attempt count):
-
-```34:57:helicalbi/sql_agent/nodes/planner.py
-def planner_node(state: AgentState) -> Dict[str, Any]:
-    """LLM step: choose the next InstantBI tool call or stop."""
-    loop = int(state.get("tool_loop_count") or 0)
-    if loop >= DEFAULT_MAX_TOOL_LOOPS:
-        ...
-        return {"is_complete": True, "tool_loop_count": loop}
-    ...
-    bound = default_llm.bind_tools(dashboard_tools())
-    ai_message, _ = invoke_llm(bound, history, state=state)
-    ...
-    return {"messages": outgoing, "tool_loop_count": loop + 1}
-```
-
-Tool results are folded into state via `state_patch`:
-
-```25:26:helicalbi/sql_agent/nodes/apply_patches.py
-def apply_tool_patches(state: AgentState) -> Dict[str, Any]:
-    """Fold JSON state_patch blobs from the latest tool messages into agent state."""
-```
-
----
-
-## 3. Scenario A — Bootstrap (every request)
-
-```text
-run_dashboard_agent
-  → load_model_session
-  → SchemaIndexer + SemanticLayerIndexer (in-memory)
-  → set_indexer / set_semantic_indexer
-  → initial_agent_state + bootstrap_planner_messages
-  → graph.invoke
-```
-
-```95:133:helicalbi/sql_agent/dashboard_graph.py
-    session = load_model_session(...)
-    indexer = session.pop("indexer", None)
-    semantic_indexer = session.pop("semantic_indexer", None)
-    catalog_id = f"dashboard:{thread_id}"
-    if indexer is not None:
-        set_indexer(indexer, catalog_id)
-    if semantic_indexer is not None:
-        set_semantic_indexer(semantic_indexer, catalog_id)
-    ...
-    state = initial_agent_state(...)
-    state["messages"] = bootstrap_planner_messages(state)
-    graph = compiled_agent or get_dashboard_agent()
-    return graph.invoke(state, {"recursion_limit": recursion_limit})
-```
-
-Session load indexes both semantic model and table metadata:
-
-```107:123:helicalbi/sql_agent/instantbi_turn.py
-    indexer = SchemaIndexer()
-    indexer.index_from_cube_metadata(cube_metadata, joins)
-    schema_overview = indexer.retrieve_schema(user_query, top_k=DEFAULT_SCHEMA_TOP_K)
-    ...
-    semantic_indexer = SemanticLayerIndexer()
-    semantic_indexer.index_model(model_data, cube_info_prepared)
-    semantic_overview = semantic_indexer.overview()
-    if not semantic_overview:
-        semantic_overview = schema_overview
-```
-
-**No ChromaDB on this path.** Default is in-memory:
-
-```196:207:helicalbi/sql_agent/database/schema_indexer.py
-        if vector_index is not None:
-            self._index = vector_index
-        elif persist_directory:
-            try:
-                self._index = ChromaVectorIndex(persist_directory)
-            except ImportError:
-                ...
-                self._index = InMemoryVectorIndex()
-        else:
-            self._index = InMemoryVectorIndex()
-```
-
-SQL always goes through InstantBI `SqlExecutor` → Java `executeQuery`:
-
-```223:235:helicalbi/sql_agent/instantbi_turn.py
-def execute_sql_state(state: dict[str, Any], request_id: Optional[str] = None) -> dict[str, Any]:
-    """Run InstantBI executeQuery for an already-generated SQL state."""
-    ...
-    result = SqlExecutor().process_flow(state)
-    ...
-    return result
-```
-
----
-
-## 4. Scenario B — Semantic model is enough
-
-```text
-planner
-  → retrieve_semantic_model   # sufficient=true, no metadata RAG
-  → generate_sql(facet)
-  → execute_query(sql)
-  → build_report(facet)       # chart
-  … more facets …
-  → finish_dashboard
-  → synthesizer → dashboard
-```
-
-Semantic-first retrieve:
-
-```18:46:helicalbi/sql_agent/tools/semantic.py
-    def retrieve(self, question: str, state: dict[str, Any]) -> dict[str, Any]:
-        ...
-        semantic = get_semantic_indexer(ctx.catalog_id).retrieve(question, top_k=top_k)
-        sufficient = bool(semantic.get("sufficient"))
-        model_context = str(semantic.get("prompt") or "").strip()
-        used_metadata_fallback = False
-        schema = ""
-        if not sufficient:
-            schema = get_indexer(ctx.catalog_id).retrieve_schema(question, top_k=top_k)
-            used_metadata_fallback = bool(schema)
-        ...
-        return {
-            "ok": True,
-            "sufficient": sufficient,
-            "used_metadata_fallback": used_metadata_fallback,
-            ...
-        }
-```
-
-When `sufficient=true`, the `if not sufficient` branch is skipped — no metadata RAG.
-
----
-
-## 5. Scenario C — Semantic weak → metadata fallback
-
-Same tool; when the semantic hit is weak:
-
-```26:28:helicalbi/sql_agent/tools/semantic.py
-        if not sufficient:
-            schema = get_indexer(ctx.catalog_id).retrieve_schema(question, top_k=top_k)
-            used_metadata_fallback = bool(schema)
-```
-
-Response then includes `sufficient=false`, `used_metadata_fallback=true`, and optional `schema`. Planner may still call `retrieve_schema` if columns are still missing (`config.py` rules).
-
----
-
-## 6. Scenario D — Chart step
-
-```text
-retrieve_semantic_model → generate_sql → execute_query → build_report
-```
-
-### generate_sql (tracks asked questions)
-
-```21:51:helicalbi/sql_agent/tools/sql.py
-    def generate(self, question: str, state: dict[str, Any]) -> dict[str, Any]:
-        ...
-        result = generate_sql_for_question(
-            question,
-            session,
-            thread_id=ctx.thread_id,
-            chat_seq_id=seq,
-            request_id=ctx.request_id,
-        )
-        ...
-        return {
-            ...
-            "state_patch": {
-                "current_sub_question": question,
-                "asked_questions": append_question(state.get("asked_questions"), question),
-                "generated_sql": sql or None,
-                ...
-            },
-        }
-```
-
-### execute_query (validate, then InstantBI)
-
-```66:86:helicalbi/sql_agent/tools/sql.py
-    def execute(self, sql: str, state: dict[str, Any]) -> dict[str, Any]:
-        ...
-        error = validate_sql_against_catalog(cleaned, ctx.catalog, dialect=ctx.dialect)
-        retry = int(state.get("sql_retry_count") or 0)
-        if error:
-            ...
-            return {
-                "ok": False,
-                "error": error,
-                "state_patch": {
-                    ...
-                    "sql_retry_count": retry + 1,
-                },
-            }
-```
-
-On success it calls `execute_sql_state` → `SqlExecutor`.
-
-### build_report (dashboard chart)
-
-```57:68:helicalbi/sql_agent/tools/report.py
-        collected.append(
-            {
-                "sub_question": question or state.get("current_sub_question") or "",
-                ...
-                "report_model": chat_response.get("report_model") or {},
-                "chat_seq_id": seq,
-                "include_in_dashboard": True,
-            }
-        )
-```
-
----
-
-## 7. Scenario E — Lookup (not a chart)
-
-```text
-retrieve_semantic_model → generate_sql → execute_query → analyze_result
-```
-
-```15:36:helicalbi/sql_agent/tools/analysis.py
-    def analyze(self, note: str, state: dict[str, Any]) -> dict[str, Any]:
-        ...
-        collected.append(
-            {
-                "sub_question": state.get("current_sub_question") or "",
-                ...
-                "include_in_dashboard": False,
-            }
-        )
-        return {
-            "ok": True,
-            "analysis": analysis,
-            "state_patch": {"collected_data": collected, "sql_retry_count": 0},
-        }
-```
-
-Lookups stay in findings; they do not become dashboard tiles.
-
----
-
-## 8. Scenario F — Bad SQL / retry
-
-1. Catalog validation fails before execute (`execute` above) → `sql_retry_count++`, no `executeQuery`.
-2. Or `SqlExecutor` returns an error → `sql_retry_count` bumped in the success-path patch when `exec_error` is set.
-3. Planner is told to fix via `generate_sql` (see `TOOL_AGENT_PROMPT`), then call `execute_query` again.
-
----
-
-## 9. Scenario G — Finish + investigation picture
-
-Stop gathering:
-
-```15:20:helicalbi/sql_agent/tools/control.py
-    def finish(self, reason: str, state: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "reason": reason,
-            "state_patch": {"is_complete": True},
-        }
-```
-
-Synthesizer: LLM narrative + **programmatic** run summary (not invented by the LLM):
-
-```16:41:helicalbi/sql_agent/nodes/synthesizer.py
-def synthesizer_node(state: AgentState) -> Dict[str, Any]:
-    """Combine collected findings into the final answer; attach programmatic run stats."""
-    parsed = invoke_agent_model(...)
-    answer = (parsed.final_answer or "").strip()
-    summary = build_run_summary(state)
-    ...
-    return {
-        "final_answer": answer,
-        "is_complete": True,
-        "asked_questions": summary["asked_questions"],
-        "attempt_count": summary["attempt_count"],
-        "investigation_steps": summary["investigation_steps"],
-    }
-```
-
-How the picture is built (no LLM):
-
-```40:73:helicalbi/sql_agent/nodes/run_summary.py
-def attempt_count_from_state(state: Dict[str, Any]) -> int:
-    """How many planner tool loops ran while building the picture."""
-    return int(state.get("tool_loop_count") or 0)
-
-
-def investigation_steps_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Ordered investigation steps from collected findings (programmatic)."""
-    ...
-        steps.append(
-            {
-                "step": index,
-                "question": question,
-                "kind": "chart" if step.get("include_in_dashboard") else "lookup",
-                "analysis": str(step.get("analysis") or "").strip(),
-            }
-        )
-    ...
-
-
-def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Programmatic multi-step investigation picture for the API response."""
-    ...
-    return {
-        "asked_questions": questions,
-        "attempt_count": attempts,
-        "question_count": len(questions),
-        "investigation_steps": steps,
-    }
-```
-
-Returned on the HTTP response:
-
-```123:133:helicalbi/controller/agent_dashboard.py
-            to_send = {
-                "original_question": user_query,
-                "final_answer": result.get("final_answer") or "",
-                "dashboardid": thread_id,
-                "asked_questions": asked_questions,
-                "attempt_count": attempt_count,
-                "investigation_steps": investigation_steps,
-                "sub_questions": _public_steps(result.get("collected_data")),
-                "dashboard": result.get("dashboard") or {},
-                "token_usage": result.get("token_usage") or {},
-            }
-```
-
-| Field | Source | Meaning |
-|-------|--------|---------|
-| `asked_questions` | `generate_sql` tracking / collected | Focused sub-questions |
-| `attempt_count` | `tool_loop_count` | Planner loops |
-| `investigation_steps` | `collected_data` | Ordered chart/lookup steps |
-| `sub_questions` | `collected_data` | Full step payloads + `report_model` |
-| `final_answer` | synthesizer LLM | Narrative over the steps |
-| `dashboard` | dashboard node | Layout / items / theme |
-
----
-
-## 10. Key files
+## Key files
 
 ```text
 helicalbi/
-  controller/agent_dashboard.py
+  controller/agent_dashboard.py          # plan vs execute HTTP
   sql_agent/
-    README.md                 ← this file
-    dashboard_graph.py
-    instantbi_turn.py
-    config.py
-    state.py
-    nodes/
-      planner.py
-      apply_patches.py
-      synthesizer.py
-      dashboard.py
-      run_summary.py
-      validator.py
-    tools/
-      tools.py
-      semantic.py
-      schema.py
-      sql.py
-      analysis.py
-      report.py
-      control.py
-    database/
-      schema_indexer.py       # metadata RAG (in-memory by default)
-      semantic_indexer.py     # semantic-model RAG (in-memory)
+    README.md
+    dashboard_graph.py                   # execute_plan | ReAct planner
+    investigation.py                     # create_and_store_plan, execute detection
+    instantbi_turn.py                    # model session, execute_sql_state
+    instantbi_agent_graph.py             # per-facet SQL branch
+    modes.py                             # fast | balanced | research
+    constants.py                         # catalog paths, scores, loop budgets
+    config.py                            # re-exports prompts + numeric knobs
+    strategy_tree.py                     # public facade — import this
+    strategy/                            # catalog, selection, diagnostics, prompts, runtime
+    planning/scoring.py                  # lexical topic rank
+    prompt/                              # prompt strings
+    strategies/                          # dashboard_strategies.json, analytical_strategy.json
+    nodes/planner.py
+    nodes/execute_plan.py
+    nodes/plan_graph.py
+    nodes/apply_patches.py
+    nodes/synthesizer.py
+    nodes/dashboard.py
+    nodes/run_summary.py
+    tools/tools.py                       # dashboard_tools vs planner_tools
+    database/schema_indexer.py           # in-memory unless persist_directory is set
+    database/semantic_indexer.py
 ```
