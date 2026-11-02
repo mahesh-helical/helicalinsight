@@ -290,6 +290,7 @@ Test results are also written to `jest-stare/` when using the default Jest repor
 
 ## Related documentation
 
+- [Diagnostic capabilities](../instantbi/src/com/helicalinsight/instantbi/docs/DIAGNOSTIC_CAPABILITIES.md) — semantic-model editor fields and how Think mode matches them
 - [Backend README](../server/README.md)
 - [Instant BI README](../instantbi/README.md)
 - [Root README](../README.md) — pick your path (run vs develop)

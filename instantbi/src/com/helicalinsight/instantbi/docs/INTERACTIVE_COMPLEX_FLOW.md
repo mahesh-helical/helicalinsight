@@ -4,7 +4,7 @@ A complex question on `POST /interactive` is the **Think** path. The classifier 
 
 The Fast path (one SQL query and a chart) is described in [INTERACTIVE_FLOW.md](INTERACTIVE_FLOW.md).
 
-Code: [`helicalbi/controller/interactive.py`](../helicalbi/controller/interactive.py), [`helicalbi/interactive/auto_mode.py`](../helicalbi/interactive/auto_mode.py), [`helicalbi/interactive/think_flow.py`](../helicalbi/interactive/think_flow.py).
+Code: [`helicalbi/controller/interactive.py`](../helicalbi/controller/interactive.py), [`helicalbi/interactive/auto_mode.py`](../helicalbi/interactive/auto_mode.py), [`helicalbi/interactive/think/`](../helicalbi/interactive/think/). [`think_flow.py`](../helicalbi/interactive/think_flow.py) re-exports that package for older imports. Module roles are in [Package map](#package-map).
 
 <a id="map"></a>
 
@@ -83,6 +83,32 @@ Next: [class diagram](#classes) · [end-to-end sequence](#seq-overview)
 `create_and_store_plan` → opening insight → `run_dashboard_agent` → cited conclusion.
 
 Inside the dashboard agent, a stored plan skips the free-form planner. The graph starts at `execute_plan`, then `synthesizer`, then `dashboard`. The text the user sees as the conclusion is written afterward by `synthesize_think_final_answer`. The synthesizer text is kept only if that cited draft is empty.
+
+<a id="package-map"></a>
+
+### Package map
+
+`helicalbi.interactive.think` is the implementation. Import from that package. `think_flow.py` re-exports `ThinkTurn`, `run_think_mode`, `ThinkCitedAnswer`, the two synthesizers, and `correct_think_mode_filters`. Tests also import `_public_step`, `_opening_metadata`, and `_opening_sql_context` from that facade.
+
+| Module | Owns |
+|---|---|
+| `think/turn.py` | `ThinkTurn`: JSON and SSE, last chat turns, cancellation, then `run_think_mode` |
+| `think/orchestrator.py` | `ThinkModeOrchestrator` / `run_think_mode`: plan → opening → dashboard agent → cited conclusion |
+| `think/plan.py` | `TextOnlyPlanTransformer` (`include_in_dashboard` false) and `AskedQuestionsResolver` |
+| `think/payload_builder.py` | Client payload (`opening_insight`, `question_history`, `final_answer`, empty `chat_responses`) and the error payload |
+| `think/models.py` | `ThinkCitedAnswer` |
+| `think/history.py` | Question history. Step text prefers prose analysis and does not surface raw JSON |
+| `think/chat_shaping.py` | `public_step`: client-safe step dict |
+| `think/progress.py` | SSE progress callback. No-op when the caller did not pass one |
+| `think/abort.py` | `AbortGuard`: raise when this request id was cancelled |
+| `think/details.py` | Whether `llm_activity_details` is attached (`show_llm_activity_details`, or the request override) |
+| `think/token_usage.py` | Sum numeric token counters from plan, execute, and opening |
+| `think/constants.py` | Stage names, progress strings, and flags |
+| `think/filters/` | `ThinkModeFilterCorrector`: keep dashboard filters on the matching report item and sync labels |
+| `think/synthesis/opening.py` | Opening overview. Failure leaves `opening_insight` empty and the run continues |
+| `think/synthesis/context.py` | Numbered questions and metadata for that opening prompt |
+| `think/synthesis/final_answer.py` | Cited conclusion and citation-index cleanup |
+| `think/synthesis/fallback.py` | Cited answer with no LLM call when citation synthesis fails |
 
 <a id="classes"></a>
 
