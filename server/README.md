@@ -429,6 +429,8 @@ Create a second database (`hischeduledata`) for Quartz if using the JDBC job sto
 
 ## Related documentation
 
+- [Recycle bin import/export](docs/recycle-bin-import-export.md) — sidecar keys, the Recycle Bin option, and why a soft-deleted connection comes back active
+- [Adhoc ROLLUP](docs/adhoc-rollup.md)
 - [Frontend README](../client/README.md)
 - [Instant BI README](../instantbi/README.md)
 - [Root README](../README.md) — pick your path (run vs develop)
